@@ -4,8 +4,11 @@ import cv2
 import mediapipe as mp
 import datetime
 import time
-import pickle
 import numpy as np
+import torch
+import torch.nn as nn
+
+from collections import deque
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -16,53 +19,36 @@ from PyQt5.QtCore import QTimer, Qt
 
 
 # ============================================================
-# 2-Layer NN helpers (LOADS params dict: weight1,bias1,weight2,bias2)
+# CNN Model (must match training)
 # ============================================================
-def _sigmoid(z):
-    return 1.0 / (1.0 + np.exp(-z))
+class SmallCNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),  # 32x32
 
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),  # 16x16
 
-def nn_forward(X, params):
-    W1, b1 = params["weight1"], params["bias1"]
-    W2, b2 = params["weight2"], params["bias2"]
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),  # 8x8
 
-    X = np.asarray(X)
-
-    if X.ndim == 1:
-        X = X.reshape(-1, 1)
-
-    # If row-wise, transpose to (n_features, m)
-    if X.shape[0] != W1.shape[1] and X.shape[1] == W1.shape[1]:
-        X = X.T
-
-    if X.shape[0] != W1.shape[1]:
-        raise ValueError(
-            f"Feature mismatch: model expects {W1.shape[1]} features, got {X.shape[0]}."
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 256), nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
         )
 
-    Z1 = (W1 @ X) + b1
-    A1 = np.tanh(Z1)
-    Z2 = (W2 @ A1) + b2
-    A2 = _sigmoid(Z2)
-    return A2
-
-
-def nn_predict(params, X_rowwise):
-    X_rowwise = np.asarray(X_rowwise)
-    if X_rowwise.ndim == 1:
-        X_rowwise = X_rowwise.reshape(1, -1)
-
-    X = X_rowwise.T  # (n_features, m)
-    A2 = nn_forward(X, params)
-
-    if A2.shape[0] == 1:
-        return (A2[0] > 0.5).astype(int)
-
-    return np.argmax(A2, axis=0).astype(int)
+    def forward(self, x):
+        return self.net(x)
 
 
 # ============================================================
 # HandProcessor (MediaPipe)
+#  - returneaza:
+#    display_frame (cu overlay)
+#    clean_frame (fara overlay) -> pentru ROI SAVE / PREDICT
 # ============================================================
 class HandProcessor:
     def __init__(self):
@@ -91,6 +77,7 @@ class HandProcessor:
         if results.multi_hand_landmarks:
             hand_detected = True
             for hand_landmarks in results.multi_hand_landmarks:
+                # draw only on display_frame
                 self.mp_draw.draw_landmarks(
                     display_frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                 )
@@ -142,40 +129,54 @@ class SIMPAC_Module1(QMainWindow):
         # -----------------------------
         # PATHS
         # -----------------------------
-        self.base_dir = os.path.join(os.path.dirname(__file__), "..")
+        self.base_dir = os.path.join(os.path.dirname(__file__), "..")  # with ".." as requested
         self.save_dir = os.path.join(self.base_dir, "saved_frames")
         os.makedirs(self.save_dir, exist_ok=True)
 
         # -----------------------------
-        # LOAD MODELS
+        # LOAD CNN checkpoint (.pt)
         # -----------------------------
-        self.letters_model = None  # placeholder
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.numbers_model = None
-        self.numbers_model_path = os.path.join(
-            self.base_dir, "SignLanguageDigits", "two_layer_nn_model.pkl"
+        self.digits_cnn_path = os.path.join(
+            self.base_dir, "SignLanguageDigits", "cnn_digits_0_5_aug.pt"
         )
 
+        self.digits_cnn = None
+        self.num_classes = 10
         try:
-            with open(self.numbers_model_path, "rb") as f:
-                self.numbers_model = pickle.load(f)
+            ckpt = torch.load(self.digits_cnn_path, map_location=self.device, weights_only=False)
 
-            if self.numbers_model is None:
-                raise ValueError("Loaded object is None. Your .pkl likely saved None instead of parameters.")
+            if not isinstance(ckpt, dict):
+                raise TypeError("Checkpoint is not a dict. Expected {'model_state':..., 'num_classes':...}.")
 
-            required = {"weight1", "bias1", "weight2", "bias2"}
-            if (not isinstance(self.numbers_model, dict)) or (not required.issubset(self.numbers_model.keys())):
-                raise ValueError(f"Loaded object is not a valid NN params dict. Expected keys: {required}")
+            if "model_state" not in ckpt:
+                raise KeyError("Checkpoint missing key 'model_state'.")
 
-            print("[OK] Loaded numbers model:", self.numbers_model_path)
-            print("Keys:", self.numbers_model.keys())
-            print("weight1 shape:", self.numbers_model["weight1"].shape)
-            print("weight2 shape:", self.numbers_model["weight2"].shape)
+            # In cazul tau ai avut num_classes in ckpt; daca lipseste, default 10
+            self.num_classes = int(ckpt.get("num_classes", 10))
+
+            model = SmallCNN(num_classes=self.num_classes)
+            model.load_state_dict(ckpt["model_state"])
+            model.to(self.device)
+            model.eval()
+
+            self.digits_cnn = model
+
+            print("[OK] Loaded CNN checkpoint:", self.digits_cnn_path)
+            print("Device:", self.device, "| num_classes:", self.num_classes)
 
         except Exception as e:
-            self.numbers_model = None
-            print(f"[ERROR] Unable to load numbers model from: {self.numbers_model_path}")
-            print("        Details:", e)
+            self.digits_cnn = None
+            print("[ERROR] Unable to load CNN checkpoint from:", self.digits_cnn_path)
+            print("Details:", e)
+
+        # -----------------------------
+        # SOFTMAX CONFIDENCE SMOOTHING
+        # -----------------------------
+        self.prob_buffer = deque(maxlen=5)   # n frames
+        self.conf_threshold = 0.3            # confidence
+        self.margin_threshold = 0.01         # dif top1 si top2 (0.1-0.3)
 
         # -----------------------------
         # VIEWER STATE
@@ -229,8 +230,9 @@ class SIMPAC_Module1(QMainWindow):
         model_layout.addWidget(model_title)
 
         self.model_letters_btn = QRadioButton("Model Letters (placeholder)")
-        self.model_numbers_btn = QRadioButton("Model Digits (2-Layer NN)")
+        self.model_numbers_btn = QRadioButton("Model Digits (CNN + Softmax Vote)")
         self.model_letters_btn.setChecked(True)
+
         self.model_letters_btn.toggled.connect(lambda: self.change_model("Letters"))
         self.model_numbers_btn.toggled.connect(lambda: self.change_model("Numbers"))
 
@@ -263,7 +265,6 @@ class SIMPAC_Module1(QMainWindow):
         self.prev_btn.setStyleSheet("background-color: #dddddd; border-radius: 8px;")
         self.next_btn.setStyleSheet("background-color: #dddddd; border-radius: 8px;")
 
-        # IMPORTANT: START exits viewer mode and returns to camera
         self.start_btn.clicked.connect(self.start_camera_mode)
         self.stop_btn.clicked.connect(lambda: self.video_timer.stop())
         self.clear_btn.clicked.connect(self.clear_text)
@@ -317,13 +318,9 @@ class SIMPAC_Module1(QMainWindow):
         self.next_btn.setEnabled(False)
 
     # -----------------------------
-    # NEW: Start camera mode (exit viewer/preview)
+    # Camera mode
     # -----------------------------
     def start_camera_mode(self):
-        """
-        If we are in preview/viewer mode, exit it and return to live camera mode.
-        Then start the camera timer.
-        """
         if self.viewer_mode:
             self.viewer_mode = False
             self.status_label.setText("CAMERA MODE")
@@ -334,11 +331,13 @@ class SIMPAC_Module1(QMainWindow):
         self.video_timer.start(30)
 
     # -----------------------------
-    # BASIC ACTIONS
+    # Basic actions
     # -----------------------------
     def change_model(self, model_name):
         self.selected_model = model_name
         self.status_label.setText(f"SWITCHED TO: {model_name.upper()} MODEL")
+        # reset buffer cand schimbi modelul
+        self.prob_buffer.clear()
 
     def update_clock(self):
         now = datetime.datetime.now()
@@ -349,41 +348,68 @@ class SIMPAC_Module1(QMainWindow):
         self.full_sentence = ""
         self.last_detected_char = ""
         self.sentence_display.setText("")
+        self.prob_buffer.clear()
 
     # -----------------------------
-    # ROI + FEATURES
+    # ROI
     # -----------------------------
     def build_roi_64(self, clean_frame_bgr, bbox):
         if bbox is None:
             return None
-
         x1, y1, x2, y2 = bbox
         roi = clean_frame_bgr[y1:y2, x1:x2]
         if roi.size == 0:
             return None
-
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray_64 = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
         return gray_64
 
-    def build_features_from_image(self, gray_64):
-        if gray_64 is None:
+    # -----------------------------
+    # CNN -> softmax probabilities (per-frame)
+    # -----------------------------
+    def predict_probs_cnn(self, gray_64):
+        """
+        Returneaza vector de probabilitati (num_classes,) pentru UN frame.
+        """
+        if self.digits_cnn is None or gray_64 is None:
             return None
-        return gray_64.flatten().reshape(1, -1).astype(np.float32)
 
-    def predict_numbers(self, features):
-        if self.numbers_model is None or features is None:
-            return "?"
+        x = gray_64.astype(np.float32) / 255.0
+        x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,64,64)
 
-        try:
-            pred_class = nn_predict(self.numbers_model, features)[0]
-            return str(int(pred_class))
-        except Exception as e:
-            print("[ERROR] numbers predict failed:", e)
-            return "?"
+        with torch.no_grad():
+            logits = self.digits_cnn(x)  # (1, num_classes)
+            probs = torch.softmax(logits, dim=1).squeeze(0)  # (num_classes,)
+
+        return probs.detach().cpu().numpy()
 
     # -----------------------------
-    # SAVE / VIEWER (saved frames)
+    # Softmax smoothing + decision
+    # -----------------------------
+    def decide_from_prob_buffer(self):
+        """
+        Media probabilitatilor pe ultimele N frame-uri, apoi:
+          - top1_conf >= conf_threshold
+          - top1 - top2 >= margin_threshold
+        Returneaza: (predicted_char or None, top1_conf, margin)
+        """
+        if len(self.prob_buffer) < self.prob_buffer.maxlen:
+            return None, None, None
+
+        avg_probs = np.mean(np.stack(self.prob_buffer, axis=0), axis=0)  # (num_classes,)
+        top1 = int(np.argmax(avg_probs))
+        sorted_probs = np.sort(avg_probs)
+        top1_conf = float(sorted_probs[-1])
+        top2_conf = float(sorted_probs[-2]) if len(sorted_probs) >= 2 else 0.0
+        margin = top1_conf - top2_conf
+
+        if top1_conf >= self.conf_threshold and margin >= self.margin_threshold:
+            return str(top1), top1_conf, margin
+
+        return None, top1_conf, margin
+
+    # -----------------------------
+    # SAVE / VIEWER
     # -----------------------------
     def refresh_saved_list(self):
         exts = (".png", ".jpg", ".jpeg", ".bmp")
@@ -504,30 +530,52 @@ class SIMPAC_Module1(QMainWindow):
 
         display_frame, clean_frame, hand_detected, _, bbox = self.processor.process_frame(frame)
 
+        predicted_char = None
+        info = ""
+
         if hand_detected:
-            self.status_label.setText(f"SCANNING GESTURE ({self.selected_model})")
             self.status_label.setStyleSheet("color: green;")
 
             if self.selected_model == "Numbers":
                 gray_64 = self.build_roi_64(clean_frame, bbox)
-                features = self.build_features_from_image(gray_64)
-                predicted_char = self.predict_numbers(features)
+
+                probs = self.predict_probs_cnn(gray_64)
+                if probs is not None:
+                    self.prob_buffer.append(probs)
+
+                predicted_char, top1_conf, margin = self.decide_from_prob_buffer()
+
+                if top1_conf is not None:
+                    info = f" conf={top1_conf:.2f} margin={margin:.2f} buf={len(self.prob_buffer)}/{self.prob_buffer.maxlen}"
+
+                self.status_label.setText(f"SCANNING DIGITS (CNN+softmax){info}")
+
+                # daca am decis o cifra stabila, resetam buffer ca sa nu repete imediat
+                if predicted_char is not None:
+                    self.prob_buffer.clear()
+
             else:
+                self.status_label.setText("SCANNING GESTURE (LETTERS)")
                 predicted_char = "X"
 
-            now_t = time.time()
-            cooldown_ok = (now_t - self.last_append_time) >= self.append_cooldown_sec
+            # Append only if we have a stable predicted_char (or letters)
+            if predicted_char is not None:
+                now_t = time.time()
+                cooldown_ok = (now_t - self.last_append_time) >= self.append_cooldown_sec
 
-            if predicted_char != self.last_detected_char and cooldown_ok:
-                self.full_sentence += predicted_char
-                self.sentence_display.setText(self.full_sentence)
-                self.last_detected_char = predicted_char
-                self.last_append_time = now_t
+                if predicted_char != self.last_detected_char and cooldown_ok:
+                    self.full_sentence += predicted_char
+                    self.sentence_display.setText(self.full_sentence)
+                    self.last_detected_char = predicted_char
+                    self.last_append_time = now_t
+
         else:
             self.status_label.setText("NO HAND DETECTED")
             self.status_label.setStyleSheet("color: #000080;")
             self.last_detected_char = ""
+            self.prob_buffer.clear()
 
+        # bbox for display
         if bbox is not None:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
