@@ -1,0 +1,5 @@
+# python 3.11
+opencv-python==4.10.0.84
+mediapipe==0.10.14
+pillow==10.4.0
+PyQt5==5.15.10
