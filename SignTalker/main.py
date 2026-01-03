@@ -5,10 +5,14 @@ import mediapipe as mp
 import datetime
 import time
 import numpy as np
+
+from collections import deque
+
 import torch
 import torch.nn as nn
 
-from collections import deque
+import tensorflow as tf
+from tensorflow.keras.models import load_model
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -19,7 +23,7 @@ from PyQt5.QtCore import QTimer, Qt
 
 
 # ============================================================
-# CNN Model (must match training)
+# DIGITS CNN
 # ============================================================
 class SmallCNN(nn.Module):
     def __init__(self, num_classes=10):
@@ -45,10 +49,7 @@ class SmallCNN(nn.Module):
 
 
 # ============================================================
-# HandProcessor (MediaPipe)
-#  - returneaza:
-#    display_frame (cu overlay)
-#    clean_frame (fara overlay) -> pentru ROI SAVE / PREDICT
+# HandProcessor
 # ============================================================
 class HandProcessor:
     def __init__(self):
@@ -57,7 +58,7 @@ class HandProcessor:
             static_image_mode=False,
             max_num_hands=1,
             min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.2
         )
         self.mp_draw = mp.solutions.drawing_utils
 
@@ -68,10 +69,8 @@ class HandProcessor:
         frame_rgb = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(frame_rgb)
 
-        hand_landmarks_list = []
         hand_detected = False
         bbox = None
-
         h, w = clean_frame.shape[:2]
 
         if results.multi_hand_landmarks:
@@ -84,7 +83,6 @@ class HandProcessor:
 
                 xs, ys = [], []
                 for lm in hand_landmarks.landmark:
-                    hand_landmarks_list.extend([lm.x, lm.y, lm.z])
                     xs.append(lm.x)
                     ys.append(lm.y)
 
@@ -102,7 +100,7 @@ class HandProcessor:
                 bbox = (x1, y1, x2, y2)
                 break
 
-        return display_frame, clean_frame, hand_detected, hand_landmarks_list, bbox
+        return display_frame, clean_frame, hand_detected, bbox
 
 
 # ============================================================
@@ -122,61 +120,79 @@ class SIMPAC_Module1(QMainWindow):
         self.last_detected_char = ""
         self.selected_model = "Letters"
 
-        # Debounce / cooldown
+        # Debounce / cooldown (scriere text)
         self.last_append_time = 0.0
         self.append_cooldown_sec = 0.6
 
         # -----------------------------
         # PATHS
         # -----------------------------
-        self.base_dir = os.path.join(os.path.dirname(__file__), "..")  # with ".." as requested
+        self.base_dir = os.path.join(os.path.dirname(__file__), "..")  # with ".."
         self.save_dir = os.path.join(self.base_dir, "saved_frames")
         os.makedirs(self.save_dir, exist_ok=True)
 
         # -----------------------------
-        # LOAD CNN checkpoint (.pt)
+        # LABEL MAP (LETTERS) - 29 clase
+        # -----------------------------
+        self.letters_classes = [
+            'A','B','C','D','E','F','G','H','I','J','K','L',
+            'M','N','O','P','Q','R','S','T','U','V','W','X',
+            'Y','Z','Blank','Space','Del'
+        ]  # 29
+        if len(self.letters_classes) != 29:
+            raise ValueError("letters_classes must have 29 entries to match Dense(29).")
+
+        # -----------------------------
+        # LOAD DIGITS MODEL (PyTorch)
         # -----------------------------
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.digits_cnn_path = os.path.join(
-            self.base_dir, "SignLanguageDigits", "cnn_digits_0_5_aug.pt"
-        )
+        self.digits_cnn_path = os.path.join(self.base_dir, "SignLanguageDigits", "cnn_digits_0_5_aug.pt")
 
         self.digits_cnn = None
-        self.num_classes = 10
+        self.digits_num_classes = 6  # fallback
         try:
             ckpt = torch.load(self.digits_cnn_path, map_location=self.device, weights_only=False)
+            if not isinstance(ckpt, dict) or "model_state" not in ckpt:
+                raise ValueError("Digits checkpoint must be dict with key 'model_state'.")
 
-            if not isinstance(ckpt, dict):
-                raise TypeError("Checkpoint is not a dict. Expected {'model_state':..., 'num_classes':...}.")
-
-            if "model_state" not in ckpt:
-                raise KeyError("Checkpoint missing key 'model_state'.")
-
-            # In cazul tau ai avut num_classes in ckpt; daca lipseste, default 10
-            self.num_classes = int(ckpt.get("num_classes", 10))
-
-            model = SmallCNN(num_classes=self.num_classes)
+            self.digits_num_classes = int(ckpt.get("num_classes", 10))
+            model = SmallCNN(num_classes=self.digits_num_classes)
             model.load_state_dict(ckpt["model_state"])
             model.to(self.device)
             model.eval()
-
             self.digits_cnn = model
 
-            print("[OK] Loaded CNN checkpoint:", self.digits_cnn_path)
-            print("Device:", self.device, "| num_classes:", self.num_classes)
-
+            print("[OK] Loaded DIGITS CNN:", self.digits_cnn_path, "| device:", self.device,
+                  "| num_classes:", self.digits_num_classes)
         except Exception as e:
             self.digits_cnn = None
-            print("[ERROR] Unable to load CNN checkpoint from:", self.digits_cnn_path)
-            print("Details:", e)
+            print("[ERROR] Digits model load failed:", e)
 
         # -----------------------------
-        # SOFTMAX CONFIDENCE SMOOTHING
+        # LOAD LETTERS MODEL (Keras)
         # -----------------------------
-        self.prob_buffer = deque(maxlen=5)   # n frames
-        self.conf_threshold = 0.3            # confidence
-        self.margin_threshold = 0.01         # dif top1 si top2 (0.1-0.3)
+        self.letters_model = None
+        self.letters_model_path = os.path.join(self.base_dir, "SignLanguageLetter", "letters_model.h5")  # change if needed
+
+        try:
+            self.letters_model = load_model(self.letters_model_path)
+            print("[OK] Loaded LETTERS model:", self.letters_model_path)
+        except Exception as e:
+            self.letters_model = None
+            print("[ERROR] Letters model load failed:", e)
+
+        # -----------------------------
+        # SOFTMAX CONFIDENCE SMOOTHING (buffers)
+        # -----------------------------
+        self.digits_prob_buffer = deque(maxlen=12)
+        self.letters_prob_buffer = deque(maxlen=12)
+
+        # thresholds (tune)
+        self.digits_conf_threshold = 0.75
+        self.digits_margin_threshold = 0.15
+
+        self.letters_conf_threshold = 0.75
+        self.letters_margin_threshold = 0.15
 
         # -----------------------------
         # VIEWER STATE
@@ -229,8 +245,8 @@ class SIMPAC_Module1(QMainWindow):
         model_title.setFont(QFont("Arial", 10, QFont.Bold))
         model_layout.addWidget(model_title)
 
-        self.model_letters_btn = QRadioButton("Model Letters (placeholder)")
-        self.model_numbers_btn = QRadioButton("Model Digits (CNN + Softmax Vote)")
+        self.model_letters_btn = QRadioButton("Model Letters (Keras)")
+        self.model_numbers_btn = QRadioButton("Model Digits (PyTorch)")
         self.model_letters_btn.setChecked(True)
 
         self.model_letters_btn.toggled.connect(lambda: self.change_model("Letters"))
@@ -327,7 +343,6 @@ class SIMPAC_Module1(QMainWindow):
             self.status_label.setStyleSheet("color: #000080;")
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
-
         self.video_timer.start(30)
 
     # -----------------------------
@@ -336,8 +351,8 @@ class SIMPAC_Module1(QMainWindow):
     def change_model(self, model_name):
         self.selected_model = model_name
         self.status_label.setText(f"SWITCHED TO: {model_name.upper()} MODEL")
-        # reset buffer cand schimbi modelul
-        self.prob_buffer.clear()
+        self.digits_prob_buffer.clear()
+        self.letters_prob_buffer.clear()
 
     def update_clock(self):
         now = datetime.datetime.now()
@@ -348,63 +363,72 @@ class SIMPAC_Module1(QMainWindow):
         self.full_sentence = ""
         self.last_detected_char = ""
         self.sentence_display.setText("")
-        self.prob_buffer.clear()
+        self.digits_prob_buffer.clear()
+        self.letters_prob_buffer.clear()
 
     # -----------------------------
-    # ROI
+    # ROI: 64x64 grayscale normalized [0,1]
     # -----------------------------
-    def build_roi_64(self, clean_frame_bgr, bbox):
+    def build_roi_64_gray_norm(self, clean_frame_bgr, bbox):
         if bbox is None:
             return None
+
         x1, y1, x2, y2 = bbox
         roi = clean_frame_bgr[y1:y2, x1:x2]
         if roi.size == 0:
             return None
+
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray_64 = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-        return gray_64
+        x = gray_64.astype(np.float32) / 255.0  # normalized
+        return x  # shape (64,64) float32 in [0,1]
 
     # -----------------------------
-    # CNN -> softmax probabilities (per-frame)
+    # DIGITS: per-frame softmax probs (PyTorch)
     # -----------------------------
-    def predict_probs_cnn(self, gray_64):
-        """
-        Returneaza vector de probabilitati (num_classes,) pentru UN frame.
-        """
-        if self.digits_cnn is None or gray_64 is None:
+    def digits_probs(self, gray_norm_64):
+        if self.digits_cnn is None or gray_norm_64 is None:
             return None
 
-        x = gray_64.astype(np.float32) / 255.0
-        x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,64,64)
-
+        x = torch.from_numpy(gray_norm_64).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,64,64)
         with torch.no_grad():
-            logits = self.digits_cnn(x)  # (1, num_classes)
-            probs = torch.softmax(logits, dim=1).squeeze(0)  # (num_classes,)
+            logits = self.digits_cnn(x)  # (1,C)
+            probs = torch.softmax(logits, dim=1).squeeze(0)  # (C,)
 
+        print(probs)
         return probs.detach().cpu().numpy()
 
     # -----------------------------
-    # Softmax smoothing + decision
+    # LETTERS: per-frame probs
     # -----------------------------
-    def decide_from_prob_buffer(self):
-        """
-        Media probabilitatilor pe ultimele N frame-uri, apoi:
-          - top1_conf >= conf_threshold
-          - top1 - top2 >= margin_threshold
-        Returneaza: (predicted_char or None, top1_conf, margin)
-        """
-        if len(self.prob_buffer) < self.prob_buffer.maxlen:
+    def letters_probs(self, gray_norm_64):
+        if self.letters_model is None or gray_norm_64 is None:
+            return None
+
+        # Keras expects (1,64,64,1)
+        x = gray_norm_64[..., np.newaxis][np.newaxis, ...]  # (1,64,64,1)
+        probs = self.letters_model.predict(x, verbose=0)[0]  # (29,)
+        print(np.argmax(probs))
+        return probs.astype(np.float32)
+
+    # -----------------------------
+    # Decision from buffer: mean probs + threshold + margin
+    # -----------------------------
+    @staticmethod
+    def decide_from_buffer(prob_buffer, conf_th, margin_th):
+        if len(prob_buffer) < prob_buffer.maxlen:
             return None, None, None
 
-        avg_probs = np.mean(np.stack(self.prob_buffer, axis=0), axis=0)  # (num_classes,)
+        avg_probs = np.mean(np.stack(prob_buffer, axis=0), axis=0)
         top1 = int(np.argmax(avg_probs))
+
         sorted_probs = np.sort(avg_probs)
         top1_conf = float(sorted_probs[-1])
         top2_conf = float(sorted_probs[-2]) if len(sorted_probs) >= 2 else 0.0
         margin = top1_conf - top2_conf
 
-        if top1_conf >= self.conf_threshold and margin >= self.margin_threshold:
-            return str(top1), top1_conf, margin
+        if top1_conf >= conf_th and margin >= margin_th:
+            return top1, top1_conf, margin
 
         return None, top1_conf, margin
 
@@ -413,9 +437,6 @@ class SIMPAC_Module1(QMainWindow):
     # -----------------------------
     def refresh_saved_list(self):
         exts = (".png", ".jpg", ".jpeg", ".bmp")
-        if not os.path.isdir(self.save_dir):
-            self.saved_images = []
-            return
         files = [f for f in os.listdir(self.save_dir) if f.lower().endswith(exts)]
         files.sort()
         self.saved_images = [os.path.join(self.save_dir, f) for f in files]
@@ -432,41 +453,40 @@ class SIMPAC_Module1(QMainWindow):
             self.status_label.setStyleSheet("color: #000080;")
             return
 
-        display_frame, clean_frame, hand_detected, _, bbox = self.processor.process_frame(frame)
+        display_frame, clean_frame, hand_detected, bbox = self.processor.process_frame(frame)
         if not hand_detected:
             self.status_label.setText("NO HAND TO SAVE")
             self.status_label.setStyleSheet("color: #000080;")
             return
 
-        gray_64 = self.build_roi_64(clean_frame, bbox)
-        if gray_64 is None:
+        gray_norm = self.build_roi_64_gray_norm(clean_frame, bbox)
+        if gray_norm is None:
             self.status_label.setText("ROI ERROR")
             self.status_label.setStyleSheet("color: #000080;")
             return
 
+        # save as grayscale image (0..255)
+        gray_u8 = (gray_norm * 255.0).clip(0, 255).astype(np.uint8)
+
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"roi64_{ts}.png"
         path = os.path.join(self.save_dir, filename)
+        cv2.imwrite(path, gray_u8)
 
-        cv2.imwrite(path, gray_64)
         self.status_label.setText(f"SAVED CLEAN ROI: {filename}")
         self.status_label.setStyleSheet("color: green;")
-
         self.refresh_saved_list()
 
     def toggle_viewer_mode(self):
         self.viewer_mode = not self.viewer_mode
-
         if self.viewer_mode:
             self.refresh_saved_list()
             self.viewer_index = 0
             self.video_timer.stop()
             self.status_label.setText(f"VIEWER MODE ({len(self.saved_images)} images)")
             self.status_label.setStyleSheet("color: #000080;")
-
             self.prev_btn.setEnabled(len(self.saved_images) > 1)
             self.next_btn.setEnabled(len(self.saved_images) > 1)
-
             self.show_saved_image()
         else:
             self.status_label.setText("CAMERA MODE")
@@ -528,7 +548,7 @@ class SIMPAC_Module1(QMainWindow):
         if not ret:
             return
 
-        display_frame, clean_frame, hand_detected, _, bbox = self.processor.process_frame(frame)
+        display_frame, clean_frame, hand_detected, bbox = self.processor.process_frame(frame)
 
         predicted_char = None
         info = ""
@@ -536,36 +556,59 @@ class SIMPAC_Module1(QMainWindow):
         if hand_detected:
             self.status_label.setStyleSheet("color: green;")
 
+            gray_norm = self.build_roi_64_gray_norm(clean_frame, bbox)
+
             if self.selected_model == "Numbers":
-                gray_64 = self.build_roi_64(clean_frame, bbox)
-
-                probs = self.predict_probs_cnn(gray_64)
+                probs = self.digits_probs(gray_norm)
                 if probs is not None:
-                    self.prob_buffer.append(probs)
+                    self.digits_prob_buffer.append(probs)
 
-                predicted_char, top1_conf, margin = self.decide_from_prob_buffer()
+                cls, conf, margin = self.decide_from_buffer(
+                    self.digits_prob_buffer,
+                    self.digits_conf_threshold,
+                    self.digits_margin_threshold
+                )
 
-                if top1_conf is not None:
-                    info = f" conf={top1_conf:.2f} margin={margin:.2f} buf={len(self.prob_buffer)}/{self.prob_buffer.maxlen}"
+                if conf is not None:
+                    info = f" conf={conf:.2f} margin={margin:.2f} buf={len(self.digits_prob_buffer)}/{self.digits_prob_buffer.maxlen}"
+                self.status_label.setText(f"SCANNING DIGITS (softmax){info}")
 
-                self.status_label.setText(f"SCANNING DIGITS (CNN+softmax){info}")
-
-                # daca am decis o cifra stabila, resetam buffer ca sa nu repete imediat
-                if predicted_char is not None:
-                    self.prob_buffer.clear()
+                if cls is not None:
+                    predicted_char = str(cls)
+                    self.digits_prob_buffer.clear()
 
             else:
-                self.status_label.setText("SCANNING GESTURE (LETTERS)")
-                predicted_char = "X"
+                probs = self.letters_probs(gray_norm)
+                if probs is not None:
+                    self.letters_prob_buffer.append(probs)
 
-            # Append only if we have a stable predicted_char (or letters)
+                cls, conf, margin = self.decide_from_buffer(
+                    self.letters_prob_buffer,
+                    self.letters_conf_threshold,
+                    self.letters_margin_threshold
+                )
+
+                if conf is not None:
+                    info = f" conf={conf:.2f} margin={margin:.2f} buf={len(self.letters_prob_buffer)}/{self.letters_prob_buffer.maxlen}"
+                self.status_label.setText(f"SCANNING LETTERS (softmax){info}")
+
+                if cls is not None:
+                    predicted_char = self.letters_classes[cls]  # map index -> label
+                    self.letters_prob_buffer.clear()
+
+            # Append only if stable char decided
             if predicted_char is not None:
                 now_t = time.time()
                 cooldown_ok = (now_t - self.last_append_time) >= self.append_cooldown_sec
 
                 if predicted_char != self.last_detected_char and cooldown_ok:
-                    self.full_sentence += predicted_char
-                    self.sentence_display.setText(self.full_sentence)
+                    # Optional: if predicted_char is 'Blank' ignore (or handle differently)
+                    if predicted_char == "Blank":
+                        pass
+                    else:
+                        self.full_sentence += predicted_char
+                        self.sentence_display.setText(self.full_sentence)
+
                     self.last_detected_char = predicted_char
                     self.last_append_time = now_t
 
@@ -573,7 +616,8 @@ class SIMPAC_Module1(QMainWindow):
             self.status_label.setText("NO HAND DETECTED")
             self.status_label.setStyleSheet("color: #000080;")
             self.last_detected_char = ""
-            self.prob_buffer.clear()
+            self.digits_prob_buffer.clear()
+            self.letters_prob_buffer.clear()
 
         # bbox for display
         if bbox is not None:
