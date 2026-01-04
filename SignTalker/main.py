@@ -191,7 +191,7 @@ class SIMPAC_Module1(QMainWindow):
         self.digits_conf_threshold = 0.55
         self.digits_margin_threshold = 0.1
 
-        self.letters_conf_threshold = 0.65
+        self.letters_conf_threshold = 0.45
         self.letters_margin_threshold = 0.1
 
         # -----------------------------
