@@ -155,7 +155,7 @@ class SIMPAC_Module1(QMainWindow):
             if not isinstance(ckpt, dict) or "model_state" not in ckpt:
                 raise ValueError("Digits checkpoint must be dict with key 'model_state'.")
 
-            self.digits_num_classes = int(ckpt.get("num_classes", 10))
+            self.digits_num_classes = int(ckpt.get("num_new_classes", 10))
             model = SmallCNN(num_classes=self.digits_num_classes)
             model.load_state_dict(ckpt["model_state"])
             model.to(self.device)
@@ -185,14 +185,14 @@ class SIMPAC_Module1(QMainWindow):
         # SOFTMAX CONFIDENCE SMOOTHING (buffers)
         # -----------------------------
         self.digits_prob_buffer = deque(maxlen=12)
-        self.letters_prob_buffer = deque(maxlen=12)
+        self.letters_prob_buffer = deque(maxlen=20)
 
         # thresholds (tune)
-        self.digits_conf_threshold = 0.75
-        self.digits_margin_threshold = 0.15
+        self.digits_conf_threshold = 0.55
+        self.digits_margin_threshold = 0.1
 
-        self.letters_conf_threshold = 0.75
-        self.letters_margin_threshold = 0.15
+        self.letters_conf_threshold = 0.65
+        self.letters_margin_threshold = 0.1
 
         # -----------------------------
         # VIEWER STATE
@@ -369,24 +369,75 @@ class SIMPAC_Module1(QMainWindow):
     # -----------------------------
     # ROI: 64x64 grayscale normalized [0,1]
     # -----------------------------
+    # def build_roi_64_gray_norm(self, clean_frame_bgr, bbox):
+    #     if bbox is None:
+    #         return None
+    #
+    #     x1, y1, x2, y2 = bbox
+    #     roi = clean_frame_bgr[y1:y2, x1:x2]
+    #     if roi.size == 0:
+    #         return None
+    #
+    #     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    #     gray_64 = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+    #     x = gray_64.astype(np.float32) / 255.0  # normalized
+    #     return x  # shape (64,64) float32 in [0,1]
+
+    def expand_bbox(self, bbox, pad, frame_shape):
+        x1, y1, x2, y2 = bbox
+        h, w = frame_shape[:2]
+
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(w, x2 + pad)
+        y2 = min(h, y2 + pad)
+
+        return x1, y1, x2, y2
+
     def build_roi_64_gray_norm(self, clean_frame_bgr, bbox):
         if bbox is None:
             return None
 
-        x1, y1, x2, y2 = bbox
+        pad = 40
+        x1, y1, x2, y2 = self.expand_bbox(bbox, pad, clean_frame_bgr.shape)
+
         roi = clean_frame_bgr[y1:y2, x1:x2]
+
         if roi.size == 0:
             return None
 
+        # 1) Grayscale
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray_64 = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-        x = gray_64.astype(np.float32) / 255.0  # normalized
-        return x  # shape (64,64) float32 in [0,1]
+
+        # 2) CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray)
+
+        # 3) Normalize [0,255]
+        gray_normalized = cv2.normalize(gray_enhanced, None, 0, 255, cv2.NORM_MINMAX)
+
+        # 4) Resize la 52x52 (ca 6px padding pe fiecare latură => 64x64 final)
+        inner = cv2.resize(gray_normalized, (56, 56), interpolation=cv2.INTER_AREA)
+
+        # 5) Padding 6px cu pixeli din margine
+        # a) margine “copiată” (edge padding):
+        gray_64 = cv2.copyMakeBorder(
+            inner, 4, 4, 4, 4,
+            borderType=cv2.BORDER_REPLICATE
+        )
+
+        # Alternativ, mai “smooth”:
+        # gray_64 = cv2.copyMakeBorder(inner, 6, 6, 6, 6, cv2.BORDER_REFLECT_101)
+
+        # 6) Normalizare finală [0,1]
+        x = gray_64.astype(np.float32) / 255.0
+        return x
 
     # -----------------------------
     # DIGITS: per-frame softmax probs (PyTorch)
     # -----------------------------
     def digits_probs(self, gray_norm_64):
+
         if self.digits_cnn is None or gray_norm_64 is None:
             return None
 
