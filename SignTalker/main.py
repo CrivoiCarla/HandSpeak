@@ -586,8 +586,13 @@ class SIMPAC_Module1(QMainWindow):
     def display_bgr(self, bgr_img):
         h, w, ch = bgr_img.shape
         qt_img = QImage(bgr_img.data, w, h, ch * w, QImage.Format_RGB888).rgbSwapped()
-        self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(850, 500, Qt.KeepAspectRatio))
-
+        self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(
+            self.video_label.width(),
+            self.video_label.height(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation
+        ))
+g
     # -----------------------------
     # MAIN LOOP
     # -----------------------------
