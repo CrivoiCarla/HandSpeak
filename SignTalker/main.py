@@ -592,7 +592,7 @@ class SIMPAC_Module1(QMainWindow):
             Qt.KeepAspectRatioByExpanding,
             Qt.SmoothTransformation
         ))
-g
+
     # -----------------------------
     # MAIN LOOP
     # -----------------------------
